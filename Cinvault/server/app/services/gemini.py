@@ -32,6 +32,7 @@ async def ask_gemini(message: str, context: str | None = None) -> str | None:
         "If the context does not include a requested fact, say CineVault does not have it yet "
         "and suggest the closest useful next step. Keep answers concise and practical."
     )
+
     user_prompt = f"{context or 'No CineVault context was available.'}\n\nUser question: {message}"
     url = f"{GEMINI_BASE_URL}/models/{settings.gemini_model}:generateContent"
 

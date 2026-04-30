@@ -8,8 +8,8 @@ from jose import JWTError, jwt
 from app.config import get_settings
 from app.database import get_database
 from app.models.schemas import ChatRequest, ChatResponse
-from app.services.anime import current_season_anime, get_anime_details, search_anime, top_anime
-from app.services.chat_context import build_chat_context
+from app.services.anime import current_season_anime, get_anime_details, search_anime, top_anime # Keep this line
+from app.services.chat_context import build_chat_context, _clean_lookup_query # Import _clean_lookup_query
 from app.services.gemini import ask_gemini
 from app.services.mock_data import MOVIES, search_movies as mock_search_movies
 from app.services.prices import get_current_deals
@@ -17,6 +17,7 @@ from app.services.streaming import get_combined_streaming_availability
 from app.services.tmdb import search_movies as tmdb_search_movies
 from app.services.tv import get_tv_details, popular_tv, search_tv
 from app.utils.object_id import serialize_doc
+from app.services.chat_context import _safe # Import _safe helper for consistent error handling
 
 router = APIRouter(prefix="/chatbot", tags=["chatbot"])
 optional_bearer = HTTPBearer(auto_error=False)
@@ -47,52 +48,11 @@ async def get_optional_user(
     return serialize_doc(user)
 
 
-def _clean_lookup_query(message: str) -> str:
-    cleaned = message.lower()
-    for phrase in (
-        "where can i stream",
-        "where should i stream",
-        "where do i stream",
-        "where can i watch",
-        "where should i watch",
-        "where to watch",
-        "can i stream",
-        "can i watch",
-        "is streaming",
-        "streaming",
-        "available",
-        "availability",
-        "watch all of",
-        "watch",
-        "all of",
-        "where can i",
-        "where should i",
-        "where is",
-        "find",
-        "show me",
-        "movie",
-        "tv show",
-        "anime",
-    ):
-        cleaned = cleaned.replace(phrase, " ")
-    cleaned = re.sub(r"[^a-z0-9:'&+*\-\s]", " ", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned or message
-
-
 @router.post("", response_model=ChatResponse)
 async def chatbot(
     payload: ChatRequest,
     current_user: dict[str, Any] | None = Depends(get_optional_user),
 ) -> ChatResponse:
-    context = await build_chat_context(payload.message, current_user=current_user)
-    gemini_reply = await ask_gemini(payload.message, context=context)
-    if gemini_reply:
-        return ChatResponse(
-            reply=gemini_reply,
-            suggestions=["Find streaming availability", "Show Blu-ray deals", "Recommend movies, TV, or anime"],
-        )
-
     message = payload.message.lower()
     availability_question = (
         "where" in message and "watch" in message
@@ -101,11 +61,14 @@ async def chatbot(
     if "deal" in message or "price" in message:
         db = get_database()
         deals = await get_current_deals(db)
-        best_deal = sorted(deals, key=lambda item: item["price"])[0]
-        return ChatResponse(
-            reply=f"The best current deal is {best_deal['title']} on {best_deal['format']} at {best_deal['retailer']} for ${best_deal['price']}.",
-            suggestions=["Show me 4K deals", "Track a price alert", "Open library"],
-        )
+        if deals: # Only return if deals are actually found
+            best_deal = sorted(deals, key=lambda item: item["price"])[0]
+            return ChatResponse(
+                reply=f"The best current deal is {best_deal['title']} on {best_deal['format']} at {best_deal['retailer']} for ${best_deal['price']}.",
+                suggestions=["Show me 4K deals", "Track a price alert", "Open library"],
+            )
+        # If no deals found, let it fall through to Gemini.
+        # This will be handled by the general Gemini fallback at the end.
 
     if availability_question:
         query = _clean_lookup_query(payload.message)
@@ -116,73 +79,89 @@ async def chatbot(
             tv_matches = []
         if tv_matches:
             show = tv_matches[0]
-            try:
-                details = await get_tv_details(int(show["tmdbId"]))
-            except Exception:
-                details = show
+            details = await _safe(get_tv_details(int(show["tmdbId"])), show)
             providers = details.get("streamingAvailability", [])
             if providers:
-                services = ", ".join(
-                    f"{item.get('service')} ({item.get('type')}, {item.get('region')})"
-                    for item in providers[:8]
-                )
+                services = ", ".join(f"{item.get('service')} ({item.get('type')}, {item.get('region')})" for item in providers[:8])
                 return ChatResponse(
                     reply=f"{details.get('title', show.get('title'))} is listed on {services}.",
                     suggestions=["Search another title", "Show TV recommendations", "Find Blu-ray deals"],
                 )
-
-        try:
-            anime_matches = await search_anime(query, limit=5)
-        except Exception:
-            anime_matches = []
+            else: # If TV show found but no providers
+                return ChatResponse(
+                    reply=f"I found '{details.get('title', show.get('title'))}' but could not find streaming availability information for it.",
+                    suggestions=["Search another title", "Show TV recommendations", "Find Blu-ray deals"],
+                )
+        anime_matches = await _safe(search_anime(query, limit=5), [])
         if anime_matches:
             anime = anime_matches[0]
-            try:
-                details = await get_anime_details(int(anime["malId"]))
-            except Exception:
-                details = anime
-            streaming_links = details.get("streaming", [])
-            if streaming_links:
-                services = ", ".join(
-                    f"{item.get('name')} ({item.get('url')})"
-                    for item in streaming_links[:6]
-                    if item.get("name")
-                )
-                return ChatResponse(
-                    reply=f"{details.get('title', anime.get('title'))} has streaming links from Jikan for {services}.",
-                    suggestions=["Search another anime", "Show anime recommendations", "Find streaming availability"],
-                )
 
+            # Add a relevance check for anime matches
+            anime_title_lower = anime.get("title", "").lower()
+            query_words = set(query.split())
+            anime_title_words = set(anime_title_lower.split())
+
+            # If there's no word overlap between the query and the anime title,
+            # and the query isn't empty, consider it an irrelevant match.
+            if not query_words.intersection(anime_title_words) and len(query_words) > 0:
+                anime_matches = [] # Discard the match
+
+            if anime_matches: # Re-check if matches are still present after relevance filter
+                details = await _safe(get_anime_details(int(anime["malId"])), anime)
+                streaming_links = details.get("streaming", [])
+                if streaming_links:
+                    services = ", ".join(f"{item.get('name')} ({item.get('url')})" for item in streaming_links[:6] if item.get("name"))
+                    return ChatResponse(
+                        reply=f"{details.get('title', anime.get('title'))} has streaming links from Jikan for {services}.",
+                        suggestions=["Search another anime", "Show anime recommendations", "Find streaming availability"],
+                    )
+                else: # If anime found but no streaming links
+                    return ChatResponse(
+                        reply=f"I found '{details.get('title', anime.get('title'))}' but could not find streaming links for it.",
+                        suggestions=["Search another anime", "Show anime recommendations", "Find Blu-ray availability"],
+                    )
+        movie = None # Reset movie for the next search type, or if no anime/tv found
         try:
-            matches = await tmdb_search_movies(query)
+            tmdb_matches = await tmdb_search_movies(query)
         except Exception:
-            matches = []
+            tmdb_matches = []
         mock_matches = mock_search_movies(query)
-        movie = matches[0] if matches else (mock_matches[0] if mock_matches else MOVIES[0])
-        movie_id = movie.get("tmdbId")
-        availability = []
-        if movie_id:
-            try:
-                availability = await get_combined_streaming_availability(int(movie_id))
-            except Exception:
-                availability = []
-        if availability:
-            services = ", ".join(
-                f"{item.get('service')} ({item.get('type')}, {item.get('region')})"
-                for item in availability[:8]
-            )
-            source_note = " Sources: " + ", ".join(
-                sorted({source for item in availability for source in item.get("sources", [item.get("source", "Unknown")])})
-            )
-            return ChatResponse(
-                reply=f"{movie['title']} is listed on {services}.{source_note}",
-                suggestions=["Search another movie", "Show trending movies", "Find Blu-ray price"],
-            )
 
-        services = ", ".join(movie.get("streaming", [])) or "no known services"
+        if tmdb_matches:
+            movie = tmdb_matches[0]
+        elif mock_matches: # Fix: this was a bug, should be mock_matches[0]
+            movie = mock_matches[0]
+
+        if movie:
+            movie_id = movie.get("tmdbId")
+            availability = []
+            if movie_id:
+                availability = await _safe(get_combined_streaming_availability(int(movie_id)), [])
+            
+            if availability:
+                services = ", ".join(f"{item.get('service')} ({item.get('type')}, {item.get('region')})" for item in availability[:8])
+                source_note = " Sources: " + ", ".join(sorted({source for item in availability for source in item.get("sources", [item.get("source", "Unknown")])}))
+                return ChatResponse(
+                    reply=f"{movie['title']} is listed on {services}.{source_note}",
+                    suggestions=["Search another movie", "Show trending movies", "Find Blu-ray price"],
+                )
+            else:
+                # Fallback to mock_data's streaming if no external availability
+                mock_streaming_services = ", ".join(movie.get("streaming", []))
+                if mock_streaming_services:
+                    return ChatResponse(
+                        reply=f"{movie['title']} is currently listed on {mock_streaming_services} in CineVault availability data.",
+                        suggestions=["Search another movie", "Show trending movies", "Find Blu-ray price"],
+                    )
+                else: # If movie found but no streaming info at all (neither external nor mock)
+                    return ChatResponse(
+                        reply=f"I found '{movie['title']}' but could not find streaming availability information for it.",
+                        suggestions=["Search another movie", "Show trending movies", "Find Blu-ray price"],
+                    )
+        # If no specific media item was found by any of the above searches (movie is None)
         return ChatResponse(
-            reply=f"{movie['title']} is currently listed on {services} in CineVault availability data.",
-            suggestions=["Search another movie", "Show trending movies", "Find Blu-ray price"],
+            reply=f"I couldn't find any movies, TV shows, or anime matching '{query}'. Please check the spelling or try a different title.",
+            suggestions=["Search for a movie", "Search for a TV show", "Recommend something"],
         )
 
     if "recommend" in message or "watch" in message:
@@ -232,11 +211,23 @@ async def chatbot(
 
         picks = sorted(MOVIES, key=lambda item: item["rating"], reverse=True)[:3]
         titles = ", ".join(movie["title"] for movie in picks)
+        # This block always returns picks from MOVIES, so it will always return a ChatResponse.
         return ChatResponse(
             reply=f"Based on high ratings, I would start with {titles}. Add a few ratings to your library and recommendations will get more personal.",
             suggestions=["Add to library", "Show Sci-Fi picks", "Show trending now"],
         )
 
+    # Fallback to Gemini for anything not handled by specific logic
+    context = await build_chat_context(payload.message, current_user=current_user)
+    # Revert: remove strict_context_mode parameter
+    gemini_reply = await ask_gemini(payload.message, context=context) 
+    if gemini_reply:
+        return ChatResponse(
+            reply=gemini_reply,
+            suggestions=["Find streaming availability", "Show Blu-ray deals", "Recommend movies, TV, or anime"],
+        )
+
+    # Final generic fallback if Gemini also doesn't provide a specific reply
     return ChatResponse(
         reply="I can help with recommendations, streaming availability, Blu-ray deals, and price alerts.",
         suggestions=["Recommend a movie", "Find the best deal", "Where can I stream Dune?"],
